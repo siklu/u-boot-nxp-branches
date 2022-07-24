@@ -18,6 +18,7 @@
 #define R_CPLD_LOGIC_RESET_CAUSE            0x3
 #define R_CPLD_LOGIC_MISC_STATUS            0x4
 #define R_CPLD_LOGIC_WD_RW                  0x5
+#define R_CPLD_LOGIC_ETHERNITY_BOARD        0x6
 #define R_CPLD_LOGIC_SFP_MODE               0x7
 #define R_CPLD_LOGIC_DIP_MODE               0x8
 #define R_CPLD_LOGIC_MODEM_LEDS_CTRL        0x9
@@ -119,13 +120,34 @@ typedef union
 	u8 uint8;
 	struct
 	{
-		u8 cfg_wd_src:1;	// When asserted to '1' it selects a dummy clock to the WD device on board. As a result, It cancels the WD operation. (Software WD triggers no longer necessary, reset will not be done to the board upon missing SW WD)  , -- This is not an operational mode -- ONLY for debug!!  ,  ,
-		u8 cfg_wd_ignore:1;	// Strobe the WD reset device. When writing 1 to this register, the CPLD issues a single 20us pulse to the WD device
+		/* When asserted to '1' it selects a dummy clock to the WD
+		 * device on board. As a result, It cancels the WD operation.
+		 * (Software WD triggers no longer necessary, reset will not be
+		 * done to the board upon missing SW WD), -- This is not an
+		 * operational mode -- ONLY for debug */
+		u8 cfg_wd_src:1;
+
+		/* Strobe the WD reset device. When writing 1 to this register,
+		 * the CPLD issues a single 20us pulse to the WD device */
+		u8 cfg_wd_ignore:1;
+
 		u8 padding0:2;
 		u8 cfg_wd_wdi:1;
-		u8 padding1:3;
+		u8 cfg_fpga_8020_rst:1;
+		u8 from_fpga_8020_rst:1;	/* Not yet implemented */
+		u8 padding1:1;
 	} s;
 } T_CPLD_LOGIC_WD_RW_REGS;
+
+
+typedef union
+{
+	u8 uint8;
+	struct
+	{
+		u8 cfg_rst_n:1;		// When asserted to '0' resets the Ethernity switch.
+	} s;
+} T_CPLD_LOGIC_ETHERNITY_REGS;
 
 
 typedef union
