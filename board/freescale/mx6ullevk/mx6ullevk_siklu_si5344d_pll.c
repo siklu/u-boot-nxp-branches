@@ -64,6 +64,31 @@ static int wait_for_device_ready(void)
 }
 #endif
 
+/*
+ * The register table rewrites the device's own I2C address at entry 6 of 462
+ * ({ 0x000B, 0x58 }), which moves it from the unburned address to the burned one.
+ * i2c-0 is shared with the RTC, the temperature sensor and an SFP cage and it
+ * rejects transfers transiently, so a single lost probe here used to send the
+ * remaining 455 writes to an address nothing answers on.
+ */
+#define PLL_ADDR_PROBE_RETRIES		5
+#define PLL_ADDR_PROBE_DELAY_US		20000
+
+static int pll_probe_addr(u8 addr)
+{
+	int attempt, rc = -1;
+
+	for (attempt = 0 ; attempt < PLL_ADDR_PROBE_RETRIES && rc != 0 ; attempt++)
+	{
+		if (attempt)
+			udelay(PLL_ADDR_PROBE_DELAY_US);
+
+		rc = i2c_probe(addr);
+	}
+
+	return rc;
+}
+
 static void set_pll_page_reg(u8 new_page)
 {
 	int old_bus = i2c_get_bus_num();
@@ -227,6 +252,20 @@ int siklu_si5344d_pll_reg_burn()
 	int old_bus = i2c_get_bus_num();
 	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
 
+	/*
+	 * siklu_si5344d_get_pll_device_addr() leaves current_pll_addr untouched when
+	 * neither address answers, and it starts out as 0xFF, so without this the
+	 * whole table can be written to an address that was never probed.
+	 */
+	if (current_pll_addr != CONFIG_SYS_I2C_UNBURNED_PLL_ADDR &&
+		current_pll_addr != CONFIG_SYS_I2C_BURNED_PLL_ADDR)
+	{
+		printf("Error: PLL addr 0x%02x is neither 0x%02x nor 0x%02x, skipping burn\n",
+				current_pll_addr, CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+		i2c_set_bus_num(old_bus);
+		return CMD_RET_FAILURE;
+	}
+
 	for (i=0 ; i<si5344_revd_register_config_num ; i++)
 	{
 		val  = si5344_revd_registers[i].value;
@@ -245,20 +284,44 @@ int siklu_si5344d_pll_reg_burn()
 
 		if (reg == 0xB && page == 0) // I2C Address
 		{
-			rc = i2c_probe(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+			rc = pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
 
 			if (rc == 0)
 			{
 				current_pll_addr = CONFIG_SYS_I2C_BURNED_PLL_ADDR;
 			}
-			else
+			else if (i2c_probe(current_pll_addr) == 0)
 			{
-				printf("Error: Expected PLL device addr 0x%02x was not found\n", CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+				/*
+				 * The device kept the address it had, so the write above was
+				 * lost. Linux binds the PLL at the burned address only, so
+				 * repeat the write instead of carrying on at this one.
+				 */
+				printf("Warning: PLL kept addr 0x%02x, repeating the I2C_ADDR write\n", current_pll_addr);
+
+				i2c_reg_write(current_pll_addr, reg, val);
+				rc = pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+
+				if (rc == 0)
+					current_pll_addr = CONFIG_SYS_I2C_BURNED_PLL_ADDR;
+			}
+
+			if (rc != 0)
+			{
+				/*
+				 * The device answers on neither address, so the remaining 455
+				 * writes have nowhere to go. A power cycle reloads I2C_ADDR
+				 * from NVM and the next boot burns the table again.
+				 */
+				printf("Error: Expected PLL device addr 0x%02x was not found, aborting burn at register %d\n",
+						CONFIG_SYS_I2C_BURNED_PLL_ADDR, i);
+				i2c_set_bus_num(old_bus);
+				return CMD_RET_FAILURE;
 			}
 		}
 	}
 
-//	printf("PLL is ready. Device addr: 0x%02x\n", current_pll_addr);
+	printf("PLL: %d registers burned, device addr 0x%02x\n", si5344_revd_register_config_num, current_pll_addr);
 
 	i2c_set_bus_num(old_bus);
 
