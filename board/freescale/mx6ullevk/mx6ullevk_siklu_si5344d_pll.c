@@ -160,11 +160,13 @@ static int do_siklu_si5344d_pll_reg_write(cmd_tbl_t *cmdtp, int flag, int argc, 
 	if (argc < 4)
 	{
 		printf("Error: Not enough arguments\n");
+		rc = CMD_RET_FAILURE;
+		return rc;
 	}
 
-	page = simple_strtoul(argv[1], NULL, 8);
-	reg  = simple_strtoul(argv[2], NULL, 8);
-	val  = simple_strtoul(argv[3], NULL, 8);
+	page = simple_strtoul(argv[1], NULL, 16);
+	reg  = simple_strtoul(argv[2], NULL, 16);
+	val  = simple_strtoul(argv[3], NULL, 16);
 
 	si5344d_pll_reg_write(page, reg, val);
 
