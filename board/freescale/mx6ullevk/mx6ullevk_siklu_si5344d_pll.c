@@ -71,8 +71,20 @@
 #define PLL_DEVICE_READY_TIMEOUT_MS	1000
 #define PLL_DEVICE_READY_POLL_US	10000
 
-/* Time for the device to act on a blind HARD_RST before it is asked anything. */
+/*
+ * Time for the device to act on a blind HARD_RST before it is asked anything.
+ * The reset starts a load from NVM, so the wait matters here; how long it
+ * really takes is settled by the DEVICE_READY poll and its timeout, not by
+ * this figure.
+ */
 #define PLL_HARD_RST_SETTLE_US		50000
+
+/*
+ * Clocking the bus idle resets nothing, so the device needs only enough time
+ * to see an idle bus before it is probed. No NVM load follows it and no
+ * DEVICE_READY poll belongs after it.
+ */
+#define PLL_BUS_IDLE_SETTLE_US		1000
 
 /*
  * Board resets attempted for one unconfigured PLL, counted across boots in the
@@ -709,71 +721,127 @@ static int pll_blind_hard_reset_at(u8 addr)
  */
 static int pll_wait_device_ready(void)
 {
-	ulong start = get_timer(0);
+	int old_bus = i2c_get_bus_num();
+	int rc = -1;
+	ulong start;
+
+	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
+	start = get_timer(0);
 
 	do {
 		u8 val = 0;
 
 		if (i2c_read(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, PLL_DEVICE_READY_REG, 1, &val, 1) == 0 &&
 			val == PLL_DEVICE_READY_VALUE)
-			return 0;
+		{
+			rc = 0;
+			break;
+		}
 
 		if (i2c_read(CONFIG_SYS_I2C_BURNED_PLL_ADDR, PLL_DEVICE_READY_REG, 1, &val, 1) == 0 &&
 			val == PLL_DEVICE_READY_VALUE)
-			return 0;
+		{
+			rc = 0;
+			break;
+		}
 
 		udelay(PLL_DEVICE_READY_POLL_US);
 	} while (get_timer(start) < PLL_DEVICE_READY_TIMEOUT_MS);
 
-	return -1;
+	i2c_set_bus_num(old_bus);
+
+	return rc;
 }
 
-/* Stage 2: reach a device that listens to the bus without acknowledging. */
-static void pll_recover_blind_hard_reset(void)
+/*
+ * One blind HARD_RST attempt: the pair of writes to both addresses, the wait
+ * for the NVM load a reset starts, and the probe that says whether it worked.
+ * Reporting the outcome per pass is what lets a field log name the action that
+ * revived the device rather than only the fact that it came back.
+ */
+static int pll_blind_hard_reset_pass(int pass)
 {
-	int old_bus = i2c_get_bus_num();
-	int pass, idle_rc;
+	pll_blind_hard_reset_at(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR);
+	pll_blind_hard_reset_at(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
 
-	printf("PLL: stage 2, the device answered on neither 0x%02x nor 0x%02x; writing HARD_RST blind\n",
-			CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR);
-
-	idle_rc = siklu_i2c0_force_idle();
-	if (idle_rc != 0)
-	{
-		printf("PLL: stage 2, i2c-%d stayed busy through the clocking, rc %d; writing anyway\n",
-				CONFIG_SYS_PLL_BUS_NUM, idle_rc);
-	}
-
-	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-
-	/*
-	 * Twice, because one byte lost on the way costs the whole sequence and
-	 * nothing on this path can tell whether that happened.
-	 */
-	for (pass = 0 ; pass < 2 ; pass++)
-	{
-		pll_blind_hard_reset_at(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR);
-		pll_blind_hard_reset_at(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
-		udelay(PLL_HARD_RST_SETTLE_US);
-	}
+	udelay(PLL_HARD_RST_SETTLE_US);
 
 	if (pll_wait_device_ready() == 0)
 	{
-		printf("PLL: stage 2, the device reports DEVICE_READY\n");
+		printf("PLL: stage 2, blind HARD_RST pass %d written, the device reports DEVICE_READY\n", pass);
 	}
 	else
 	{
-		printf("PLL: stage 2, no DEVICE_READY within %d ms\n", PLL_DEVICE_READY_TIMEOUT_MS);
+		printf("PLL: stage 2, blind HARD_RST pass %d written, no DEVICE_READY within %d ms\n",
+				pass, PLL_DEVICE_READY_TIMEOUT_MS);
 	}
 
-	i2c_set_bus_num(old_bus);
+	siklu_si5344d_get_pll_device_addr();
+
+	if (!pll_addr_is_known())
+		return -1;
+
+	printf("PLL: stage 2 succeeded on blind HARD_RST pass %d, the device answers on 0x%02x\n",
+			pass, current_pll_addr);
+
+	return 0;
+}
+
+/*
+ * Stage 2: reach a device that listens to the bus without acknowledging.
+ *
+ * The device is probed after every action rather than once at the end, so the
+ * log names the action that revived it: freeing the bus, the first blind
+ * HARD_RST, or the second. Stopping at the first success also spares a healthy
+ * bus the blind writes it does not need.
+ */
+static void pll_recover_blind_hard_reset(void)
+{
+	int idle_rc;
+
+	printf("PLL: stage 2, the device answered on neither 0x%02x nor 0x%02x; freeing the bus first\n",
+			CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+
+	idle_rc = siklu_i2c0_force_idle();
+	if (idle_rc == 0)
+	{
+		printf("PLL: stage 2, i2c-%d clocked idle\n", CONFIG_SYS_PLL_BUS_NUM);
+	}
+	else
+	{
+		printf("PLL: stage 2, i2c-%d stayed busy through the clocking, rc %d; carrying on\n",
+				CONFIG_SYS_PLL_BUS_NUM, idle_rc);
+	}
+
+	/*
+	 * Freeing the bus resets nothing, so there is no NVM load to wait out and
+	 * no DEVICE_READY to poll. The device only needs to see an idle bus before
+	 * it is asked anything.
+	 */
+	udelay(PLL_BUS_IDLE_SETTLE_US);
 
 	siklu_si5344d_get_pll_device_addr();
 
 	if (pll_addr_is_known())
-		printf("PLL: stage 2 succeeded, the device answers on 0x%02x\n", current_pll_addr);
-	else
-		printf("PLL: stage 2 failed, the device still answers on neither address\n");
+	{
+		printf("PLL: stage 2 succeeded on the bus release alone, the device answers on 0x%02x\n",
+				current_pll_addr);
+		return;
+	}
+
+	printf("PLL: stage 2, the device stayed silent after the bus release; writing HARD_RST blind\n");
+
+	if (pll_blind_hard_reset_pass(1) == 0)
+		return;
+
+	/*
+	 * A second pass, because one byte lost on the way costs the whole attempt
+	 * and nothing on this path can tell whether that happened.
+	 */
+	if (pll_blind_hard_reset_pass(2) == 0)
+		return;
+
+	printf("PLL: stage 2 failed, the device answers on neither address after two blind HARD_RST passes\n");
 }
 
 /*
