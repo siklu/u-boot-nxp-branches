@@ -214,6 +214,18 @@ static void setup_iomux_siklu_i2c(void) {
 		printf("Error: i2c-0 recovery setup failed, rc %d. The bus works, a stuck slave will not be released\n", rc);
 }
 
+/*
+ * Nine SCL pulses and a STOP driven from GPIO, which resynchronises a slave
+ * that believes it is in the middle of a transaction. The controller reaches
+ * this by itself on a retry; the PLL recovery ladder needs it on demand,
+ * before it starts writing to a device that has stopped answering. The pin
+ * description stays private to this file.
+ */
+int siklu_i2c0_force_idle(void)
+{
+	return force_idle_bus(&i2c1_pad_info);
+}
+
 int board_spi_cs_gpio(unsigned bus, unsigned cs) {
 	int rc = -1;
 

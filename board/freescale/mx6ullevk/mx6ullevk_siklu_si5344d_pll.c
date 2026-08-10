@@ -21,6 +21,7 @@
 #include <i2c.h>
 #include <linux/delay.h>
 #include <linux/bug.h>
+#include <asm/mach-imx/mxc_i2c.h>
 
 #include "siklu_def.h"
 #include "siklu_api.h"
@@ -45,9 +46,47 @@
 #define PLL_PREAMBLE_LAST_INDEX		2
 #define PLL_PREAMBLE_LAST_REG_ADDR	0x0540
 
+/*
+ * Page 0 register 0x1E, bit 1: HARD_RST. The Si5345/44/42 Rev D family
+ * reference manual describes it as performing the same function as power
+ * cycling the device, restoring every register to its default value.
+ *
+ * Bit 0 of the same register is PDN, which powers the device down. The value
+ * written here is therefore exactly 0x02 and never 0x03: setting PDN on a
+ * device that is already failing to answer would leave nothing to recover.
+ */
+#define PLL_HARD_RST_REG		0x1E
+#define PLL_HARD_RST_VALUE		0x02
+
+/*
+ * DEVICE_READY, readable from any page, reads 0x0F once the device has
+ * finished loading its registers from NVM. The reference manual is explicit
+ * that no other register may be read or written until then - the page register
+ * 0x01 included - because an access during the load can corrupt the NVM.
+ */
+#define PLL_DEVICE_READY_REG		0xFE
+#define PLL_DEVICE_READY_VALUE		0x0F
+#define PLL_DEVICE_READY_TIMEOUT_MS	1000
+#define PLL_DEVICE_READY_POLL_US	10000
+
+/* Time for the device to act on a blind HARD_RST before it is asked anything. */
+#define PLL_HARD_RST_SETTLE_US		50000
+
+
 
 u8 current_pll_addr = -1;
 static int current_page = -1;
+
+/*
+ * The device has exactly two addresses, the factory one and the one the burn
+ * moves it to. current_pll_addr starts as 0xFF and stays there when neither
+ * answered, so this is the question "do we know where the device is".
+ */
+static int pll_addr_is_known(void)
+{
+	return current_pll_addr == CONFIG_SYS_I2C_UNBURNED_PLL_ADDR ||
+		   current_pll_addr == CONFIG_SYS_I2C_BURNED_PLL_ADDR;
+}
 
 
 /*
@@ -469,8 +508,7 @@ int siklu_si5344d_pll_reg_burn(void)
 	 * neither address answers, and it starts out as 0xFF, so without this the
 	 * whole table can be written to an address that was never probed.
 	 */
-	if (current_pll_addr != CONFIG_SYS_I2C_UNBURNED_PLL_ADDR &&
-		current_pll_addr != CONFIG_SYS_I2C_BURNED_PLL_ADDR)
+	if (!pll_addr_is_known())
 	{
 		printf("Error: PLL addr 0x%02x is neither 0x%02x nor 0x%02x, skipping burn\n",
 				current_pll_addr, CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR);
@@ -618,6 +656,130 @@ void siklu_si5344d_get_pll_device_addr(void)
 	current_page = -1;
 
 	i2c_set_bus_num(old_bus);
+}
+
+
+/*
+ * Recovery ladder, walked at boot when the device does not answer.
+ *
+ * Stage 1 is the retried probe of both addresses in
+ * siklu_si5344d_get_pll_device_addr() above, which covers a transfer the bus
+ * refused once. Stages 2 and 3 below cover a device that is not answering at
+ * all. Each stage prints what failed, what it is about to do and how it ended,
+ * so that a field log shows which stage healed the unit.
+ */
+
+/*
+ * Both writes of the blind pair go to one address. The device is page-based, so
+ * page 0 has to be selected before HARD_RST can be reached, and neither write
+ * can be confirmed - that is the whole point of this stage.
+ *
+ * i2c_write_blind() ends each transfer with a STOP, so the bus is released
+ * between the two writes and again afterwards; no separate stop is needed.
+ */
+static int pll_blind_hard_reset_at(u8 addr)
+{
+	u8 page = 0x00;
+	u8 reset = PLL_HARD_RST_VALUE;
+	int rc;
+
+	rc = i2c_write_blind(CONFIG_SYS_PLL_BUS_NUM, addr, PLL_PAGE_REG_ADDR, 1, &page, 1);
+	if (rc != 0)
+		return rc;
+
+	return i2c_write_blind(CONFIG_SYS_PLL_BUS_NUM, addr, PLL_HARD_RST_REG, 1, &reset, 1);
+}
+
+/*
+ * Waits for the register load that a hard reset starts. Reads DEVICE_READY and
+ * nothing else, on both addresses because a reset device returns to the one its
+ * NVM holds. Bounded by a timeout: a device that never reports ready must leave
+ * the boot free to carry on, which is exactly what the version of this wait
+ * that used to sit in this file - an unbounded loop - could not do.
+ */
+static int pll_wait_device_ready(void)
+{
+	ulong start = get_timer(0);
+
+	do {
+		u8 val = 0;
+
+		if (i2c_read(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, PLL_DEVICE_READY_REG, 1, &val, 1) == 0 &&
+			val == PLL_DEVICE_READY_VALUE)
+			return 0;
+
+		if (i2c_read(CONFIG_SYS_I2C_BURNED_PLL_ADDR, PLL_DEVICE_READY_REG, 1, &val, 1) == 0 &&
+			val == PLL_DEVICE_READY_VALUE)
+			return 0;
+
+		udelay(PLL_DEVICE_READY_POLL_US);
+	} while (get_timer(start) < PLL_DEVICE_READY_TIMEOUT_MS);
+
+	return -1;
+}
+
+/* Stage 2: reach a device that listens to the bus without acknowledging. */
+static void pll_recover_blind_hard_reset(void)
+{
+	int old_bus = i2c_get_bus_num();
+	int pass, idle_rc;
+
+	printf("PLL: stage 2, the device answered on neither 0x%02x nor 0x%02x; writing HARD_RST blind\n",
+			CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+
+	idle_rc = siklu_i2c0_force_idle();
+	if (idle_rc != 0)
+	{
+		printf("PLL: stage 2, i2c-%d stayed busy through the clocking, rc %d; writing anyway\n",
+				CONFIG_SYS_PLL_BUS_NUM, idle_rc);
+	}
+
+	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
+
+	/*
+	 * Twice, because one byte lost on the way costs the whole sequence and
+	 * nothing on this path can tell whether that happened.
+	 */
+	for (pass = 0 ; pass < 2 ; pass++)
+	{
+		pll_blind_hard_reset_at(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR);
+		pll_blind_hard_reset_at(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
+		udelay(PLL_HARD_RST_SETTLE_US);
+	}
+
+	if (pll_wait_device_ready() == 0)
+	{
+		printf("PLL: stage 2, the device reports DEVICE_READY\n");
+	}
+	else
+	{
+		printf("PLL: stage 2, no DEVICE_READY within %d ms\n", PLL_DEVICE_READY_TIMEOUT_MS);
+	}
+
+	i2c_set_bus_num(old_bus);
+
+	siklu_si5344d_get_pll_device_addr();
+
+	if (pll_addr_is_known())
+		printf("PLL: stage 2 succeeded, the device answers on 0x%02x\n", current_pll_addr);
+	else
+		printf("PLL: stage 2 failed, the device still answers on neither address\n");
+}
+
+/*
+ * Brings the PLL up at boot, walking the ladder only as far as it has to.
+ */
+void siklu_si5344d_pll_bring_up(void)
+{
+	siklu_si5344d_get_pll_device_addr();
+
+	if (!pll_addr_is_known())
+		pll_recover_blind_hard_reset();
+
+	if (!pll_addr_is_known())
+		return;
+
+	siklu_si5344d_pll_reg_burn();
 }
 
 

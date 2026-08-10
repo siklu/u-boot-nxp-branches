@@ -29,6 +29,8 @@ extern int siklu_88e639x_reg_write(u8 port, u8 reg, u16 val);
 
 extern void siklu_si5344d_get_pll_device_addr(void);
 extern int siklu_si5344d_pll_reg_burn(void);
+extern void siklu_si5344d_pll_bring_up(void);
+extern int siklu_i2c0_force_idle(void);
 
 extern void get_88x3310_phy_version(u32 *val_version);
 extern void get_TLK10031_version(u32 *val_version);
