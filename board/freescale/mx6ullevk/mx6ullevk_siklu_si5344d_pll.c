@@ -211,7 +211,7 @@ int get_pll_tool_version(u32 *tool_version)
 	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_SPECIAL_AND_REVISION_REG_ADDR, &val_special_and_revision);
 	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_REG_ADDR, &val_minor);
 	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_AND_MAJOR_REG_ADDR, &val_minor_and_major);
-	*tool_version = (val_special_and_revision << 16) || (val_minor << 8) || val_minor_and_major;
+	*tool_version = (val_special_and_revision << 16) | (val_minor << 8) | val_minor_and_major;
 	return rc;
 
 }
