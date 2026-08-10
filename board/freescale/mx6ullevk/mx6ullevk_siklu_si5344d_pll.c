@@ -20,6 +20,7 @@
 #include <spi_flash.h>
 #include <i2c.h>
 #include <linux/delay.h>
+#include <linux/bug.h>
 
 #include "siklu_def.h"
 #include "siklu_api.h"
@@ -32,6 +33,17 @@
 
 /* Page 0 register holding the device's own i2c address. */
 #define PLL_I2C_ADDR_REG	0x0B
+
+/*
+ * The generated tables open with a three-entry preamble ending in a write to
+ * 0x0540, and the 300 ms pause the vendor script calls for belongs right after
+ * it. The pause below and the check in siklu_si5344d_pll_reg_burn() are keyed
+ * on these two constants together, so a table regenerated with a preamble of a
+ * different length is reported instead of quietly moving the pause somewhere
+ * it does nothing.
+ */
+#define PLL_PREAMBLE_LAST_INDEX		2
+#define PLL_PREAMBLE_LAST_REG_ADDR	0x0540
 
 
 u8 current_pll_addr = -1;
@@ -414,6 +426,41 @@ int siklu_si5344d_pll_reg_burn(void)
 			return CMD_RET_FAILURE;
 	}
 
+	/*
+	 * The tables are data in generated headers, and C cannot assert on their
+	 * contents at build time - an element of a const array is not a constant
+	 * expression, which gcc rejects in _Static_assert. What is a constant is
+	 * their size, and a regenerated export is very likely to change it, so
+	 * that much is caught before the image is ever written to a unit.
+	 *
+	 * The two checks below are written as runtime tests for that reason, but
+	 * at -O2 gcc folds them against the const tables and drops both branches -
+	 * their messages are absent from the linked image. So they cost nothing on
+	 * a device today, and they come back as a real refusal to burn the moment
+	 * a table stops matching. Do not go looking for them in a disassembly.
+	 */
+	BUILD_BUG_ON_MSG(SI5344_V1_REVD_REG_CONFIG_NUM_REGS != 462,
+			"Si5344 V1 table regenerated: re-check where its preamble ends");
+	BUILD_BUG_ON_MSG(SI5344_V2_REVD_REG_CONFIG_NUM_REGS != 462,
+			"Si5344 V2 table regenerated: re-check where its preamble ends");
+
+	if (si5344_revd_register_config_num <= PLL_PREAMBLE_LAST_INDEX)
+	{
+		printf("Error: PLL table holds %d entries, too few to carry the preamble, skipping burn\n",
+				si5344_revd_register_config_num);
+		return CMD_RET_FAILURE;
+	}
+
+	if (si5344_revd_registers[PLL_PREAMBLE_LAST_INDEX].address != PLL_PREAMBLE_LAST_REG_ADDR)
+	{
+		printf("Error: PLL table entry %d writes 0x%04x, the preamble is expected to end at 0x%04x there\n",
+				PLL_PREAMBLE_LAST_INDEX,
+				si5344_revd_registers[PLL_PREAMBLE_LAST_INDEX].address,
+				PLL_PREAMBLE_LAST_REG_ADDR);
+		printf("       The 300 ms calibration pause would land in the wrong place, skipping burn\n");
+		return CMD_RET_FAILURE;
+	}
+
 	int old_bus = i2c_get_bus_num();
 	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
 
@@ -449,7 +496,7 @@ int siklu_si5344d_pll_reg_burn(void)
 
 		wr_rc = pll_write_reg(current_pll_addr, reg, val);
 
-		if (i==2)
+		if (i == PLL_PREAMBLE_LAST_INDEX)
 		{
 			udelay(300000); //Wait 300 ms
 		}
