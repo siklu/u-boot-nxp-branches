@@ -245,9 +245,12 @@ int siklu_si5344d_pll_reg_burn()
 			si5344_revd_register_config_num = SI5344_V2_REVD_REG_CONFIG_NUM_REGS;
 			break;
 		default:
-			printf("Error: Unknown board type 0x%x. Burn latest registers set\n", board_type);
-			si5344_revd_registers = si5344_v2_revd_registers;
-			si5344_revd_register_config_num = SI5344_V2_REVD_REG_CONFIG_NUM_REGS;
+			/*
+			 * Which of the two register sets a board wants is a property of
+			 * its hardware, so an unknown board type leaves nothing safe to
+			 * burn and the PLL keeps whatever its NVM loaded.
+			 */
+			printf("Error: Unknown board type 0x%x, skipping PLL burn\n", board_type);
 			return CMD_RET_FAILURE;
 	}
 
