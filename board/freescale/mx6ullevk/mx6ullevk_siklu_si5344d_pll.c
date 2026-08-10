@@ -21,10 +21,12 @@
 #include <i2c.h>
 #include <linux/delay.h>
 #include <linux/bug.h>
+#include <environment.h>
 #include <asm/mach-imx/mxc_i2c.h>
 
 #include "siklu_def.h"
 #include "siklu_api.h"
+#include "cpld_reg.h"
 
 #include "Si5344D-Dxxx-GM-V1-Registers.h"
 #include "Si5344D-Dxxx-GM-V2-Registers.h"
@@ -72,6 +74,14 @@
 /* Time for the device to act on a blind HARD_RST before it is asked anything. */
 #define PLL_HARD_RST_SETTLE_US		50000
 
+/*
+ * Board resets attempted for one unconfigured PLL, counted across boots in the
+ * environment. The counter is cleared by a successful burn, so a unit that
+ * heals never carries its history forward, and the ladder stops rather than
+ * looping when the resets do not help.
+ */
+#define PLL_RECOVERY_ATTEMPTS_ENV	"pll_recovery_attempts"
+#define PLL_RECOVERY_MAX_ATTEMPTS	3
 
 
 u8 current_pll_addr = -1;
@@ -767,6 +777,70 @@ static void pll_recover_blind_hard_reset(void)
 }
 
 /*
+ * Clears the board-reset counter. Touches the environment only when a counter
+ * is actually stored, so a healthy boot never writes flash.
+ */
+static void pll_recovery_attempts_clear(void)
+{
+	if (env_get(PLL_RECOVERY_ATTEMPTS_ENV) == NULL)
+		return;
+
+	if (env_set(PLL_RECOVERY_ATTEMPTS_ENV, NULL) == 0 && env_save() == 0)
+		printf("PLL: cleared the recovery attempt counter\n");
+	else
+		printf("Warning: PLL recovery attempt counter survives in the environment; clear %s by hand\n",
+				PLL_RECOVERY_ATTEMPTS_ENV);
+}
+
+/*
+ * Stage 3: reset the whole board through the CPLD, which drops cfg_pll_rst_n
+ * along with the rest of register 0x02 and gives the PLL a genuine power-on.
+ * This is what S99reboot does in Linux, and a PLL observably comes back from
+ * it; the driver's own cpld_unconditional_reset_board() clears cfg_sw_rst only
+ * and leaves the PLL running, which is why the whole register goes to zero
+ * here.
+ *
+ * Every path that cannot count the attempt returns instead of resetting. A unit
+ * that cannot record how many times it has tried would reset for ever, and an
+ * endless reboot is worse than a board running with an unconfigured PLL.
+ */
+static void pll_recover_board_reset(void)
+{
+	const char *stored = env_get(PLL_RECOVERY_ATTEMPTS_ENV);
+	ulong attempts = stored ? simple_strtoul(stored, NULL, 10) : 0;
+
+	if (attempts >= PLL_RECOVERY_MAX_ATTEMPTS)
+	{
+		printf("PLL: stage 3 spent, %lu board resets left the device silent; continuing the boot with an unconfigured PLL\n",
+				attempts);
+		printf("PLL: clear %s in the environment to let the ladder try again\n",
+				PLL_RECOVERY_ATTEMPTS_ENV);
+		return;
+	}
+
+	if (env_set_ulong(PLL_RECOVERY_ATTEMPTS_ENV, attempts + 1) != 0)
+	{
+		printf("PLL: stage 3 skipped, the attempt counter could not be set; continuing the boot\n");
+		return;
+	}
+
+	if (env_save() != 0)
+	{
+		printf("PLL: stage 3 skipped, the attempt counter could not be stored; continuing the boot\n");
+		return;
+	}
+
+	printf("PLL: stage 3, resetting the board through CPLD register 0x%02x, attempt %lu of %d\n",
+			R_CPLD_LOGIC_RESET_CONTROL, attempts + 1, PLL_RECOVERY_MAX_ATTEMPTS);
+
+	siklu_cpld_write(R_CPLD_LOGIC_RESET_CONTROL, 0x00);
+
+	udelay(500000);
+
+	printf("Error: PLL: stage 3 wrote the CPLD reset register and the board kept running; continuing the boot\n");
+}
+
+/*
  * Brings the PLL up at boot, walking the ladder only as far as it has to.
  */
 void siklu_si5344d_pll_bring_up(void)
@@ -777,9 +851,14 @@ void siklu_si5344d_pll_bring_up(void)
 		pll_recover_blind_hard_reset();
 
 	if (!pll_addr_is_known())
+	{
+		/* Resets the board when it can, so it usually does not return. */
+		pll_recover_board_reset();
 		return;
+	}
 
-	siklu_si5344d_pll_reg_burn();
+	if (siklu_si5344d_pll_reg_burn() == CMD_RET_SUCCESS)
+		pll_recovery_attempts_clear();
 }
 
 
