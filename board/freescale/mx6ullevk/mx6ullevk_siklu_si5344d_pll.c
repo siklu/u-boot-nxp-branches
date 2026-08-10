@@ -28,41 +28,15 @@
 #include "Si5344D-Dxxx-GM-V2-Registers.h"
 
 
-#define ACTIVE_NVM_BANK		0x00E2
-#define NVM_WRITE			0x00E3
-#define NVM_READ_BANK		0x00E4
-#define DEVICE_READY		0x00FE
-
 #define PLL_PAGE_REG_ADDR	0x0001
+
+/* Page 0 register holding the device's own i2c address. */
+#define PLL_I2C_ADDR_REG	0x0B
 
 
 u8 current_pll_addr = -1;
 static int current_page = -1;
 
-
-#if 0
-/*
-Any attempt to read or write any register other than DEVICE_READY before DEVICE_READY reads as 0x0F may corrupt
-the NVM programming and may corrupt the register contents, as they are read from NVM
-*/
-static int wait_for_device_ready(void)
-{
-	int rc = CMD_RET_SUCCESS;
-	int old_bus = i2c_get_bus_num();
-	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-	u8 val;
-
-	do {
-		val = (i2c_reg_read(DEVICE_READY, DEVICE_READY));
-	} while (val != 0x0F);
-
-	printf(" reg 0x%04x, val 0x%02x\n", DEVICE_READY, val);
-
-	i2c_set_bus_num(old_bus);
-
-	return rc;
-}
-#endif
 
 /*
  * The register table rewrites the device's own I2C address at entry 6 of 462
