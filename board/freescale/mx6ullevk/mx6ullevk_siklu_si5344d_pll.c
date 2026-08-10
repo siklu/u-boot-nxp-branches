@@ -89,41 +89,118 @@ static int pll_probe_addr(u8 addr)
 	return rc;
 }
 
-static void set_pll_page_reg(u8 new_page)
+/*
+ * i2c_reg_write() returns void and i2c_reg_read() returns the data byte, so
+ * neither carries the transfer's status and every write on the burn path used
+ * to be treated as if it had succeeded. i2c_write()/i2c_read() do carry it,
+ * which is the whole reason these two wrappers exist. The retry matches
+ * pll_probe_addr() above: the same shared bus, the same transient refusal.
+ */
+#define PLL_XFER_RETRIES		5
+#define PLL_XFER_RETRY_DELAY_US	20000
+
+static int pll_write_reg(u8 addr, u8 reg, u8 val)
 {
-	int old_bus = i2c_get_bus_num();
-	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-	i2c_reg_write(current_pll_addr, PLL_PAGE_REG_ADDR, new_page);
-	current_page = new_page;
-	i2c_set_bus_num(old_bus);
-}
+	int attempt, rc = -1;
 
-static int si5344d_pll_reg_read(u8 page, u8 reg, u8 *val)
-{
-	int rc = CMD_RET_SUCCESS;
+	for (attempt = 0 ; attempt < PLL_XFER_RETRIES && rc != 0 ; attempt++)
+	{
+		if (attempt)
+			udelay(PLL_XFER_RETRY_DELAY_US);
 
-	if (current_page != page)
-		set_pll_page_reg(page);
-
-	int old_bus = i2c_get_bus_num();
-	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-	*val = (i2c_reg_read(current_pll_addr, reg));
-	i2c_set_bus_num(old_bus);
-
-//	printf("reg 0x%04x, val 0x%02x\n", reg, *val);
+		rc = i2c_write(addr, reg, 1, &val, 1);
+	}
 
 	return rc;
 }
 
-static void si5344d_pll_reg_write(u8 page, u8 reg, u8 val)
+static int pll_read_reg(u8 addr, u8 reg, u8 *val)
 {
-	if (current_page != page)
-		set_pll_page_reg(page);
+	int attempt, rc = -1;
 
+	for (attempt = 0 ; attempt < PLL_XFER_RETRIES && rc != 0 ; attempt++)
+	{
+		if (attempt)
+			udelay(PLL_XFER_RETRY_DELAY_US);
+
+		rc = i2c_read(addr, reg, 1, val, 1);
+	}
+
+	return rc;
+}
+
+static int set_pll_page_reg(u8 new_page)
+{
+	int rc;
 	int old_bus = i2c_get_bus_num();
+
 	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-	i2c_reg_write(current_pll_addr, reg, val);
+	rc = pll_write_reg(current_pll_addr, PLL_PAGE_REG_ADDR, new_page);
 	i2c_set_bus_num(old_bus);
+
+	if (rc == 0)
+	{
+		current_page = new_page;
+	}
+	else
+	{
+		/*
+		 * The page the device holds is now unknown, and carrying the old
+		 * cached value forward would send every later register of the table
+		 * to whatever page it kept. Force the next access to select again.
+		 */
+		current_page = -1;
+		printf("Error: PLL page 0x%02x select failed at addr 0x%02x, rc %d\n",
+				new_page, current_pll_addr, rc);
+	}
+
+	return rc;
+}
+
+static int si5344d_pll_reg_read(u8 page, u8 reg, u8 *val)
+{
+	int rc;
+	int old_bus;
+
+	if (current_page != page && set_pll_page_reg(page) != 0)
+		return CMD_RET_FAILURE;
+
+	old_bus = i2c_get_bus_num();
+	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
+	rc = pll_read_reg(current_pll_addr, reg, val);
+	i2c_set_bus_num(old_bus);
+
+	if (rc != 0)
+	{
+		printf("Error: PLL read failed, page 0x%02x, reg 0x%02x, addr 0x%02x, rc %d\n",
+				page, reg, current_pll_addr, rc);
+		return CMD_RET_FAILURE;
+	}
+
+	return CMD_RET_SUCCESS;
+}
+
+static int si5344d_pll_reg_write(u8 page, u8 reg, u8 val)
+{
+	int rc;
+	int old_bus;
+
+	if (current_page != page && set_pll_page_reg(page) != 0)
+		return CMD_RET_FAILURE;
+
+	old_bus = i2c_get_bus_num();
+	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
+	rc = pll_write_reg(current_pll_addr, reg, val);
+	i2c_set_bus_num(old_bus);
+
+	if (rc != 0)
+	{
+		printf("Error: PLL write failed, page 0x%02x, reg 0x%02x, val 0x%02x, addr 0x%02x, rc %d\n",
+				page, reg, val, current_pll_addr, rc);
+		return CMD_RET_FAILURE;
+	}
+
+	return CMD_RET_SUCCESS;
 }
 
 static int do_siklu_si5344d_pll_reg_read(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[]) //
@@ -143,9 +220,10 @@ static int do_siklu_si5344d_pll_reg_read(cmd_tbl_t *cmdtp, int flag, int argc, c
 	page= simple_strtoul(argv[1], NULL, 16);
 	reg = simple_strtoul(argv[2], NULL, 16);
 
-	si5344d_pll_reg_read(page, reg, &val);
+	rc = si5344d_pll_reg_read(page, reg, &val);
 
-	printf("page:0x%02x, reg:0x%04x, val:0x%02x\n", page, reg, val);
+	if (rc == CMD_RET_SUCCESS)
+		printf("page:0x%02x, reg:0x%04x, val:0x%02x\n", page, reg, val);
 
 	return rc;
 }
@@ -168,54 +246,62 @@ static int do_siklu_si5344d_pll_reg_write(cmd_tbl_t *cmdtp, int flag, int argc, 
 	reg  = simple_strtoul(argv[2], NULL, 16);
 	val  = simple_strtoul(argv[3], NULL, 16);
 
-	si5344d_pll_reg_write(page, reg, val);
+	rc = si5344d_pll_reg_write(page, reg, val);
 
 	return rc;
 }
 
 int get_pll_part_number(u16 *part_number)
 {
-	int rc = CMD_RET_FAILURE;
+	int rc;
 	u8 val0, val1;
 #define PLL_PART_NUMBER_REG_ADDR_0 0x2
 #define PLL_PART_NUMBER_REG_ADDR_1 0x3
-	si5344d_pll_reg_read(0, PLL_PART_NUMBER_REG_ADDR_0, &val0);
-	si5344d_pll_reg_read(0, PLL_PART_NUMBER_REG_ADDR_1, &val1);
+	rc = si5344d_pll_reg_read(0, PLL_PART_NUMBER_REG_ADDR_0, &val0);
+	if (rc != CMD_RET_SUCCESS)
+		return rc;
+
+	rc = si5344d_pll_reg_read(0, PLL_PART_NUMBER_REG_ADDR_1, &val1);
+	if (rc != CMD_RET_SUCCESS)
+		return rc;
+
 	*part_number = val1 | (val0 << 8);
-	return rc;
+	return CMD_RET_SUCCESS;
 }
 
 int get_pll_device_grade(u8 *device_grade)
 {
-	int rc = CMD_RET_FAILURE;
 #define PLL_DEVICE_GRADE_REG_ADDR 0x4
-	si5344d_pll_reg_read(0, PLL_DEVICE_GRADE_REG_ADDR, device_grade);
-	return rc;
-
+	return si5344d_pll_reg_read(0, PLL_DEVICE_GRADE_REG_ADDR, device_grade);
 }
 
 int get_pll_device_revision(u8 *device_revision)
 {
-	int rc = CMD_RET_FAILURE;
 #define PLL_DEVICE_REVISION_REG_ADDR 0x5
-	si5344d_pll_reg_read(0, PLL_DEVICE_REVISION_REG_ADDR, device_revision);
-	return rc;
-
+	return si5344d_pll_reg_read(0, PLL_DEVICE_REVISION_REG_ADDR, device_revision);
 }
 
 int get_pll_tool_version(u32 *tool_version)
 {
-	int rc = CMD_RET_FAILURE;
+	int rc;
 	u8 val_special_and_revision, val_minor, val_minor_and_major;
 #define PLL_TOOL_VERSION_SPECIAL_AND_REVISION_REG_ADDR 	0x6
 #define PLL_TOOL_VERSION_MINOR_REG_ADDR 				0x7
 #define PLL_TOOL_VERSION_MINOR_AND_MAJOR_REG_ADDR 		0x8
-	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_SPECIAL_AND_REVISION_REG_ADDR, &val_special_and_revision);
-	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_REG_ADDR, &val_minor);
-	si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_AND_MAJOR_REG_ADDR, &val_minor_and_major);
-	*tool_version = (val_special_and_revision << 16) | (val_minor << 8) | val_minor_and_major;
-	return rc;
+	rc = si5344d_pll_reg_read(0, PLL_TOOL_VERSION_SPECIAL_AND_REVISION_REG_ADDR, &val_special_and_revision);
+	if (rc != CMD_RET_SUCCESS)
+		return rc;
 
+	rc = si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_REG_ADDR, &val_minor);
+	if (rc != CMD_RET_SUCCESS)
+		return rc;
+
+	rc = si5344d_pll_reg_read(0, PLL_TOOL_VERSION_MINOR_AND_MAJOR_REG_ADDR, &val_minor_and_major);
+	if (rc != CMD_RET_SUCCESS)
+		return rc;
+
+	*tool_version = (val_special_and_revision << 16) | (val_minor << 8) | val_minor_and_major;
+	return CMD_RET_SUCCESS;
 }
 
 int siklu_si5344d_pll_reg_burn()
@@ -273,14 +359,21 @@ int siklu_si5344d_pll_reg_burn()
 
 	for (i=0 ; i<si5344_revd_register_config_num ; i++)
 	{
+		int wr_rc;
+
 		val  = si5344_revd_registers[i].value;
 		page = si5344_revd_registers[i].address >> 8;
 		reg  = si5344_revd_registers[i].address & 0xFF;
 
-		if (current_page != page)
-			set_pll_page_reg(page);
+		if (current_page != page && set_pll_page_reg(page) != 0)
+		{
+			printf("Error: PLL burn stopped at entry %d of %d, page 0x%02x unreachable at addr 0x%02x\n",
+					i, si5344_revd_register_config_num, page, current_pll_addr);
+			i2c_set_bus_num(old_bus);
+			return CMD_RET_FAILURE;
+		}
 
-		i2c_reg_write(current_pll_addr, reg, val);
+		wr_rc = pll_write_reg(current_pll_addr, reg, val);
 
 		if (i==2)
 		{
@@ -289,6 +382,17 @@ int siklu_si5344d_pll_reg_burn()
 
 		if (reg == 0xB && page == 0) // I2C Address
 		{
+			/*
+			 * This entry moves the device to another address, so the probe
+			 * below says more about what happened than the write's own return
+			 * code does. A refused write here is a symptom, not the verdict.
+			 */
+			if (wr_rc != 0)
+			{
+				printf("Warning: PLL I2C_ADDR write at addr 0x%02x returned %d, probing both addresses\n",
+						current_pll_addr, wr_rc);
+			}
+
 			rc = pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
 
 			if (rc == 0)
@@ -304,7 +408,7 @@ int siklu_si5344d_pll_reg_burn()
 				 */
 				printf("Warning: PLL kept addr 0x%02x, repeating the I2C_ADDR write\n", current_pll_addr);
 
-				i2c_reg_write(current_pll_addr, reg, val);
+				pll_write_reg(current_pll_addr, reg, val);
 				rc = pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
 
 				if (rc == 0)
@@ -324,13 +428,26 @@ int siklu_si5344d_pll_reg_burn()
 				return CMD_RET_FAILURE;
 			}
 		}
+		else if (wr_rc != 0)
+		{
+			/*
+			 * Carrying on would leave a device holding part of one
+			 * configuration and part of whatever its NVM loaded, and the
+			 * success line below would still claim 462 registers. A power
+			 * cycle reloads the NVM and the next boot burns the table again.
+			 */
+			printf("Error: PLL burn stopped at entry %d of %d: page 0x%02x, reg 0x%02x, val 0x%02x, addr 0x%02x, rc %d\n",
+					i, si5344_revd_register_config_num, page, reg, val, current_pll_addr, wr_rc);
+			i2c_set_bus_num(old_bus);
+			return CMD_RET_FAILURE;
+		}
 	}
 
 	printf("PLL: %d registers burned, device addr 0x%02x\n", si5344_revd_register_config_num, current_pll_addr);
 
 	i2c_set_bus_num(old_bus);
 
-	return rc;
+	return CMD_RET_SUCCESS;
 }
 
 static int do_siklu_si5344d_pll_reg_burn(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[])
