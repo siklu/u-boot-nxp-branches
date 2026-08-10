@@ -93,10 +93,17 @@ static int pll_probe_addr(u8 addr)
  * i2c_reg_write() returns void and i2c_reg_read() returns the data byte, so
  * neither carries the transfer's status and every write on the burn path used
  * to be treated as if it had succeeded. i2c_write()/i2c_read() do carry it,
- * which is the whole reason these two wrappers exist. The retry matches
- * pll_probe_addr() above: the same shared bus, the same transient refusal.
+ * which is the whole reason these two wrappers exist. The retry answers the
+ * same transient refusal on the same shared bus that pll_probe_addr() above
+ * answers.
+ *
+ * 15 x 20 ms covers the 300 ms the register headers call the worst case for the
+ * device to finish a calibration, which is the longest window in which it can
+ * be expected to refuse a transfer: the postamble writes 0x0540 and 0x0B24
+ * right after the soft reset at 0x001C. The budget is only ever spent on a
+ * refused transfer, so an accepted write costs nothing.
  */
-#define PLL_XFER_RETRIES		5
+#define PLL_XFER_RETRIES		15
 #define PLL_XFER_RETRY_DELAY_US	20000
 
 static int pll_write_reg(u8 addr, u8 reg, u8 val)
