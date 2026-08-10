@@ -19,6 +19,9 @@ extern int siklu_board_init(void);
 extern int siklu_board_late_init_hw(void);
 extern int siklu_board_late_init_env(void);
 
+/* Writes the CPLD reset registers until the board goes down; does not return. */
+extern int siklu_board_hw_reboot(void);
+
 extern u8 current_pll_addr;
 
 extern u8 siklu_cpld_read(u8 reg);

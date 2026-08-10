@@ -26,7 +26,6 @@
 
 #include "siklu_def.h"
 #include "siklu_api.h"
-#include "cpld_reg.h"
 
 #include "Si5344D-Dxxx-GM-V1-Registers.h"
 #include "Si5344D-Dxxx-GM-V2-Registers.h"
@@ -152,6 +151,7 @@ static int pll_probe_addr(u8 addr)
  */
 #define PLL_XFER_RETRIES		15
 #define PLL_XFER_RETRY_DELAY_US	20000
+
 
 static int pll_write_reg(u8 addr, u8 reg, u8 val)
 {
@@ -898,14 +898,27 @@ static void pll_recover_board_reset(void)
 		return;
 	}
 
-	printf("PLL: stage 3, resetting the board through CPLD register 0x%02x, attempt %lu of %d\n",
-			R_CPLD_LOGIC_RESET_CONTROL, attempts + 1, PLL_RECOVERY_MAX_ATTEMPTS);
+	printf("PLL: stage 3, rebooting the board through the CPLD, attempt %lu of %d\n",
+			attempts + 1, PLL_RECOVERY_MAX_ATTEMPTS);
 
-	siklu_cpld_write(R_CPLD_LOGIC_RESET_CONTROL, 0x00);
-
-	udelay(500000);
-
-	printf("Error: PLL: stage 3 wrote the CPLD reset register and the board kept running; continuing the boot\n");
+	/*
+	 * siklu_board_hw_reboot() is this tree's production reboot, the one the
+	 * reboot command uses and the one S99reboot mirrors in Linux: it writes the
+	 * LED register and then the reset control register, and keeps writing the
+	 * pair until the board goes down. It does not return.
+	 *
+	 * Writing the reset register once and then carrying on would be worse than
+	 * staying in that loop. Zero in R_CPLD_LOGIC_RESET_CONTROL holds
+	 * cfg_ten_g_rst_n and cfg_mdm_rst_n low along with cfg_pll_rst_n, so a boot
+	 * that continued past the write would reach Linux with the 10G PHY and the
+	 * modem held in reset - a worse unit than the unconfigured PLL this ladder
+	 * exists to repair.
+	 *
+	 * The attempt counter is already stored at this point, so even a board
+	 * whose CPLD never carries the reset out advances its count on every power
+	 * cycle and boots normally once the three attempts are spent.
+	 */
+	siklu_board_hw_reboot();
 }
 
 /*
