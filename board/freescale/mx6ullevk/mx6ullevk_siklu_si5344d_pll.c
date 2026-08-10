@@ -152,6 +152,15 @@ static int pll_probe_addr(u8 addr)
 #define PLL_XFER_RETRIES		15
 #define PLL_XFER_RETRY_DELAY_US	20000
 
+/*
+ * Upper bound on the burn as a whole. A healthy one finishes well inside a
+ * second: 462 single-byte writes at 100 kHz plus the 300 ms preamble pause.
+ * The bound exists because the per-transfer retry budget above has no view of
+ * the total - 462 entries that each succeed on their fifteenth attempt are 462
+ * successful writes, so nothing in the loop would stop them, and they would
+ * hold the boot for over two minutes.
+ */
+#define PLL_BURN_TIMEOUT_MS		10000
 
 static int pll_write_reg(u8 addr, u8 reg, u8 val)
 {
@@ -538,7 +547,9 @@ int siklu_si5344d_pll_reg_burn(void)
 		return CMD_RET_FAILURE;
 	}
 
-	for (i=0 ; i<si5344_revd_register_config_num ; i++)
+	ulong burn_start = get_timer(0);
+
+	for (i=0 ; i<si5344_revd_register_config_num && get_timer(burn_start) < PLL_BURN_TIMEOUT_MS ; i++)
 	{
 		int wr_rc;
 
@@ -622,6 +633,15 @@ int siklu_si5344d_pll_reg_burn(void)
 			i2c_set_bus_num(old_bus);
 			return CMD_RET_FAILURE;
 		}
+	}
+
+	if (i < si5344_revd_register_config_num)
+	{
+		printf("Error: PLL burn stopped at entry %d of %d, the %d ms budget for the whole burn ran out after %lu ms\n",
+				i, si5344_revd_register_config_num, PLL_BURN_TIMEOUT_MS, get_timer(burn_start));
+		printf("       Every write so far was acknowledged, so the bus is carrying them and taking its retries to do it\n");
+		i2c_set_bus_num(old_bus);
+		return CMD_RET_FAILURE;
 	}
 
 	printf("PLL: %d registers burned, device addr 0x%02x\n", si5344_revd_register_config_num, current_pll_addr);
