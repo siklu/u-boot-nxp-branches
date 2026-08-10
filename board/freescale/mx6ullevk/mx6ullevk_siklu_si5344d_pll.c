@@ -591,12 +591,17 @@ int siklu_si5344d_pll_reg_burn(void)
 			{
 				current_pll_addr = CONFIG_SYS_I2C_BURNED_PLL_ADDR;
 			}
-			else if (i2c_probe(current_pll_addr) == 0)
+			else if (pll_probe_addr(current_pll_addr) == 0)
 			{
 				/*
 				 * The device kept the address it had, so the write above was
 				 * lost. Linux binds the PLL at the burned address only, so
 				 * repeat the write instead of carrying on at this one.
+				 *
+				 * This probe is retried for the same reason the one above it
+				 * is: a single refusal here would send a device that is still
+				 * answering on its old address down the abort path, which is
+				 * the failure this file exists to remove.
 				 */
 				printf("Warning: PLL kept addr 0x%02x, repeating the I2C_ADDR write\n", current_pll_addr);
 
