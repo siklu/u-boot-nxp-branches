@@ -515,27 +515,36 @@ static int do_siklu_si5344d_pll_reg_burn(cmd_tbl_t *cmdtp, int flag, int argc, c
 }
 
 
-void siklu_si5344d_get_pll_device_addr()
+void siklu_si5344d_get_pll_device_addr(void)
 {
-	int ret;
 	int old_bus = i2c_get_bus_num();
+
 	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
-	ret = i2c_probe(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR);
 
-	if (ret == 0) {
+	/*
+	 * A transient refusal here decides the whole boot: the burn that follows
+	 * has no address to write to and the PLL keeps whatever its NVM loaded.
+	 * Retry both probes the way pll_probe_addr() does on the burn path.
+	 */
+	if (pll_probe_addr(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR) == 0)
 		current_pll_addr = CONFIG_SYS_I2C_UNBURNED_PLL_ADDR;
-		i2c_set_bus_num(old_bus);
-		return;
-	}
-
-	ret = i2c_probe(CONFIG_SYS_I2C_BURNED_PLL_ADDR);
-	if (ret == 0) {
+	else if (pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR) == 0)
 		current_pll_addr = CONFIG_SYS_I2C_BURNED_PLL_ADDR;
-		i2c_set_bus_num(old_bus);
-		return;
+	else
+	{
+		printf("Error: PLL answers on neither 0x%02x nor 0x%02x on i2c-%d\n",
+				CONFIG_SYS_I2C_UNBURNED_PLL_ADDR, CONFIG_SYS_I2C_BURNED_PLL_ADDR,
+				CONFIG_SYS_PLL_BUS_NUM);
 	}
 
-	printf("Error: I2c PLL Addr is not recognized !!\n");
+	/*
+	 * The device's page register is a property of the device, and which device
+	 * this code is talking to has just been decided, so the cached page has to
+	 * go with it.
+	 */
+	current_page = -1;
+
+	i2c_set_bus_num(old_bus);
 }
 
 
