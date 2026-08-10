@@ -304,7 +304,55 @@ int get_pll_tool_version(u32 *tool_version)
 	return CMD_RET_SUCCESS;
 }
 
-int siklu_si5344d_pll_reg_burn()
+/*
+ * Registers 0x0C..0x13 of page 0 are the device's status and flag block. This
+ * tree carries no bit-level description of them - the design reports in the
+ * Si5344D-Dxxx-GM-V*-Registers.h headers list only the registers the
+ * configuration writes - so the values are printed raw and named by address.
+ * Decoding them needs the Si5344 Rev D datasheet.
+ */
+#define PLL_STATUS_REG_FIRST	0x0C
+#define PLL_STATUS_REG_LAST		0x13
+
+/*
+ * Reports what the device says about itself, so that a burn is confirmed by
+ * the chip rather than by the count of writes this code issued.
+ */
+static void print_pll_device_state(void)
+{
+	u16 part_number = 0;
+	u8 device_grade = 0;
+	u8 device_revision = 0;
+	u32 tool_version = 0;
+	u8 reg, val;
+
+	if (get_pll_part_number(&part_number) == CMD_RET_SUCCESS &&
+		get_pll_device_grade(&device_grade) == CMD_RET_SUCCESS &&
+		get_pll_device_revision(&device_revision) == CMD_RET_SUCCESS &&
+		get_pll_tool_version(&tool_version) == CMD_RET_SUCCESS)
+	{
+		printf("PLL: part %04x, grade %02x, rev %02x, tool version %06x\n",
+				part_number, device_grade, device_revision, tool_version);
+	}
+	else
+	{
+		printf("Error: PLL identification registers unreadable at addr 0x%02x\n", current_pll_addr);
+	}
+
+	printf("PLL: page 0 raw status (needs the Si5344 datasheet to decode):");
+
+	for (reg = PLL_STATUS_REG_FIRST ; reg <= PLL_STATUS_REG_LAST ; reg++)
+	{
+		if (si5344d_pll_reg_read(0, reg, &val) == CMD_RET_SUCCESS)
+			printf(" 0x%02x=0x%02x", reg, val);
+		else
+			printf(" 0x%02x=??", reg);
+	}
+
+	printf("\n");
+}
+
+int siklu_si5344d_pll_reg_burn(void)
 {
     int i, rc = CMD_RET_SUCCESS;
     u8 reg = 0;
@@ -444,6 +492,8 @@ int siklu_si5344d_pll_reg_burn()
 	}
 
 	printf("PLL: %d registers burned, device addr 0x%02x\n", si5344_revd_register_config_num, current_pll_addr);
+
+	print_pll_device_state();
 
 	i2c_set_bus_num(old_bus);
 
