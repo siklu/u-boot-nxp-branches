@@ -184,6 +184,48 @@ static int si5344d_pll_reg_write(u8 page, u8 reg, u8 val)
 	return CMD_RET_SUCCESS;
 }
 
+/*
+ * A write to page 0 register PLL_I2C_ADDR_REG moves the device to another i2c
+ * address, which makes current_pll_addr stale the moment the write lands - and
+ * moving it by hand is a working way to drive the chip from the console. Ask
+ * both addresses and adopt the one that answers, so the commands that follow
+ * reach the device instead of talking to nobody.
+ *
+ * The write's own return code is not consulted: a device that has just changed
+ * address can refuse the transfer that changed it, so the probe is the better
+ * witness. The burn path deliberately keeps its own handling, because there the
+ * goal is to force the device onto the burned address rather than to follow it
+ * wherever it went.
+ */
+static void pll_recheck_device_addr(u8 written_val)
+{
+	int old_bus = i2c_get_bus_num();
+	u8 old_addr = current_pll_addr;
+
+	i2c_set_bus_num(CONFIG_SYS_PLL_BUS_NUM);
+
+	if (pll_probe_addr(CONFIG_SYS_I2C_BURNED_PLL_ADDR) == 0)
+		current_pll_addr = CONFIG_SYS_I2C_BURNED_PLL_ADDR;
+	else if (pll_probe_addr(CONFIG_SYS_I2C_UNBURNED_PLL_ADDR) == 0)
+		current_pll_addr = CONFIG_SYS_I2C_UNBURNED_PLL_ADDR;
+	else
+	{
+		printf("Error: after writing I2C_ADDR=0x%02x the PLL answers on neither 0x%02x nor 0x%02x on i2c-%d.\n",
+				written_val, CONFIG_SYS_I2C_BURNED_PLL_ADDR, CONFIG_SYS_I2C_UNBURNED_PLL_ADDR,
+				CONFIG_SYS_PLL_BUS_NUM);
+		printf("       It sits at an address this code does not track; a power cycle reloads I2C_ADDR from NVM.\n");
+	}
+
+	if (current_pll_addr != old_addr)
+		printf("PLL: device address is now 0x%02x, was 0x%02x\n", current_pll_addr, old_addr);
+	else
+		printf("PLL: device address is still 0x%02x\n", current_pll_addr);
+
+	current_page = -1;
+
+	i2c_set_bus_num(old_bus);
+}
+
 static int do_siklu_si5344d_pll_reg_read(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[]) //
 {
     int rc = CMD_RET_SUCCESS;
@@ -228,6 +270,9 @@ static int do_siklu_si5344d_pll_reg_write(cmd_tbl_t *cmdtp, int flag, int argc, 
 	val  = simple_strtoul(argv[3], NULL, 16);
 
 	rc = si5344d_pll_reg_write(page, reg, val);
+
+	if (page == 0 && reg == PLL_I2C_ADDR_REG)
+		pll_recheck_device_addr(val);
 
 	return rc;
 }
@@ -409,7 +454,7 @@ int siklu_si5344d_pll_reg_burn(void)
 			udelay(300000); //Wait 300 ms
 		}
 
-		if (reg == 0xB && page == 0) // I2C Address
+		if (reg == PLL_I2C_ADDR_REG && page == 0) // I2C Address
 		{
 			/*
 			 * This entry moves the device to another address, so the probe
