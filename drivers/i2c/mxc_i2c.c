@@ -274,8 +274,25 @@ static void i2c_imx_stop(struct mxc_i2c_bus *i2c_bus)
  * Send start signal, chip address and
  * write register address
  */
+/*
+ * A byte that goes unacknowledged has still been shifted out onto the bus by
+ * the time the controller reports it: wait_for_sr_state(ST_IIF) has already
+ * returned, which means the transfer completed, and only the acknowledge bit
+ * came back wrong. i2c_write_blind() below uses that to reach a device that
+ * listens but cannot answer. Every other error means the byte did not go out.
+ */
+static int tx_byte_ignore_nak(struct mxc_i2c_bus *i2c_bus, u8 byte)
+{
+	int ret = tx_byte(i2c_bus, byte);
+
+	if (ret == -EREMOTEIO)
+		return 0;
+
+	return ret;
+}
+
 static int i2c_init_transfer_(struct mxc_i2c_bus *i2c_bus, u8 chip,
-			      u32 addr, int alen)
+			      u32 addr, int alen, bool ignore_nak)
 {
 	unsigned int temp;
 	int ret;
@@ -318,12 +335,16 @@ static int i2c_init_transfer_(struct mxc_i2c_bus *i2c_bus, u8 chip,
 	writeb(temp, base + (I2CR << reg_shift));
 
 	/* write slave address */
-	ret = tx_byte(i2c_bus, chip << 1);
+	ret = ignore_nak ? tx_byte_ignore_nak(i2c_bus, chip << 1)
+			 : tx_byte(i2c_bus, chip << 1);
 	if (ret < 0)
 		return ret;
 
 	while (alen--) {
-		ret = tx_byte(i2c_bus, (addr >> (alen * 8)) & 0xff);
+		u8 byte = (addr >> (alen * 8)) & 0xff;
+
+		ret = ignore_nak ? tx_byte_ignore_nak(i2c_bus, byte)
+				 : tx_byte(i2c_bus, byte);
 		if (ret < 0)
 			return ret;
 	}
@@ -421,7 +442,7 @@ static int i2c_init_transfer(struct mxc_i2c_bus *i2c_bus, u8 chip,
 		return -EINVAL;
 
 	for (retry = 0; retry < 3; retry++) {
-		ret = i2c_init_transfer_(i2c_bus, chip, addr, alen);
+		ret = i2c_init_transfer_(i2c_bus, chip, addr, alen, false);
 		if (ret >= 0)
 			return 0;
 		i2c_imx_stop(i2c_bus);
@@ -602,6 +623,58 @@ static struct mxc_i2c_bus mxc_i2c_buses[] = {
 struct mxc_i2c_bus *i2c_get_base(struct i2c_adapter *adap)
 {
 	return &mxc_i2c_buses[adap->hwadapnr];
+}
+
+/*
+ * Write a register without requiring the device to acknowledge anything.
+ *
+ * This exists for one situation: a slave that still listens to the bus but has
+ * stopped driving its acknowledge. The controller reports every byte of such a
+ * transfer as -EREMOTEIO, yet each byte was shifted out before that verdict was
+ * formed, so the device does receive them. A normal i2c_write() stops at the
+ * unacknowledged address byte and the payload never leaves the controller,
+ * which is why a device in that state cannot be commanded through it.
+ *
+ * The transfer is a complete one - START, address, register, data, STOP - so
+ * the bus is released the same way an ordinary write releases it. Errors that
+ * mean the bus did not carry the byte at all (a timeout, arbitration loss) do
+ * stop it, because retrying blindly through a wedged controller would achieve
+ * nothing.
+ *
+ * Nothing outside device recovery may use this. A caller that wants to know
+ * whether the device accepted the write must use i2c_write(), which reports a
+ * missing acknowledge as the failure it is.
+ */
+int i2c_write_blind(unsigned int bus_index, u8 chip, u32 addr, int alen,
+		    const u8 *buf, int len)
+{
+	struct mxc_i2c_bus *i2c_bus;
+	int i, ret;
+
+	if (bus_index >= ARRAY_SIZE(mxc_i2c_buses))
+		return -EINVAL;
+
+	i2c_bus = &mxc_i2c_buses[bus_index];
+	if (!i2c_bus->base)
+		return -EINVAL;
+
+	ret = i2c_init_transfer_(i2c_bus, chip, addr, alen, true);
+	if (ret < 0) {
+		i2c_imx_stop(i2c_bus);
+		return ret;
+	}
+
+	for (i = 0; i < len; i++) {
+		ret = tx_byte_ignore_nak(i2c_bus, buf[i]);
+		if (ret < 0) {
+			i2c_imx_stop(i2c_bus);
+			return ret;
+		}
+	}
+
+	i2c_imx_stop(i2c_bus);
+
+	return 0;
 }
 
 static int mxc_i2c_read(struct i2c_adapter *adap, uint8_t chip,

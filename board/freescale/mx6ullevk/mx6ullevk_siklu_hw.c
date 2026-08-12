@@ -21,6 +21,7 @@
 #include <asm/arch/sys_proto.h>
 #include <asm/gpio.h>
 #include <asm/mach-imx/iomux-v3.h>
+#include <asm/mach-imx/mxc_i2c.h>
 
 #include <miiphy.h>
 
@@ -81,6 +82,36 @@ static const iomux_v3_cfg_t i2c2_pads[] = { MX6_PAD_CSI_HSYNC__CSI_HSYNC
 		| MUX_PAD_CTRL(NO_PAD_CTRL), MX6_PAD_CSI_VSYNC__I2C2_SDA
 		| MUX_PAD_CTRL(NO_PAD_CTRL), MX6_PAD_CSI_HSYNC__I2C2_SCL
 		| MUX_PAD_CTRL(NO_PAD_CTRL) };
+
+/*
+ * Pin description for recovering i2c-1, the bus carrying the PLL, the RTC, the
+ * temperature sensor and an SFP cage. A slave that was reset mid-transfer can
+ * be left holding SDA low, which no amount of retrying at the controller
+ * clears; nine SCL pulses driven from GPIO walk it out of its byte and a STOP
+ * releases the bus. force_idle_bus() in arch/arm/mach-imx/i2c-mxv7.c does that,
+ * and setup_i2c() registers it so that mxc_i2c.c calls it on a retry.
+ *
+ * The pins are the same two the Linux device tree recovers with:
+ * scl-gpios = <&gpio4 18>, sda-gpios = <&gpio4 17> on i2c1, whose default
+ * pinctrl is MX6UL_PAD_CSI_PIXCLK__I2C1_SCL and MX6UL_PAD_CSI_MCLK__I2C1_SDA.
+ * The i2c_mode entries below are byte for byte the ones i2c1_pads[] already
+ * applies, and NO_PAD_CTRL in both modes keeps the pad control register
+ * untouched, so switching between the two modes moves the mux field and
+ * nothing else - the drive strength and the pull configuration the board boots
+ * with stay as they are.
+ */
+static struct i2c_pads_info i2c1_pad_info = {
+	.scl = {
+		.i2c_mode  = MX6_PAD_CSI_PIXCLK__I2C1_SCL | MUX_PAD_CTRL(NO_PAD_CTRL),
+		.gpio_mode = MX6_PAD_CSI_PIXCLK__GPIO4_IO18 | MUX_PAD_CTRL(NO_PAD_CTRL),
+		.gp = IMX_GPIO_NR(4, 18),
+	},
+	.sda = {
+		.i2c_mode  = MX6_PAD_CSI_MCLK__I2C1_SDA | MUX_PAD_CTRL(NO_PAD_CTRL),
+		.gpio_mode = MX6_PAD_CSI_MCLK__GPIO4_IO17 | MUX_PAD_CTRL(NO_PAD_CTRL),
+		.gp = IMX_GPIO_NR(4, 17),
+	},
+};
 
 
 static const iomux_v3_cfg_t board_id_pads[] = {
@@ -168,8 +199,31 @@ static void setup_iomux_siklu_board_id(void) {
 }
 
 static void setup_iomux_siklu_i2c(void) {
+	int rc;
+
 	imx_iomux_v3_setup_multiple_pads(i2c1_pads, ARRAY_SIZE(i2c1_pads));
 	imx_iomux_v3_setup_multiple_pads(i2c2_pads, ARRAY_SIZE(i2c2_pads));
+
+	/*
+	 * On a bus that is already idle this reads the two pins, finds them high
+	 * and only registers the recovery routine for later. It is the stuck case
+	 * that pulses SCL.
+	 */
+	rc = setup_i2c(0, CONFIG_SYS_I2C_SPEED, 0x7f, &i2c1_pad_info);
+	if (rc)
+		printf("Error: i2c-0 recovery setup failed, rc %d. The bus works, a stuck slave will not be released\n", rc);
+}
+
+/*
+ * Nine SCL pulses and a STOP driven from GPIO, which resynchronises a slave
+ * that believes it is in the middle of a transaction. The controller reaches
+ * this by itself on a retry; the PLL recovery ladder needs it on demand,
+ * before it starts writing to a device that has stopped answering. The pin
+ * description stays private to this file.
+ */
+int siklu_i2c0_force_idle(void)
+{
+	return force_idle_bus(&i2c1_pad_info);
 }
 
 int board_spi_cs_gpio(unsigned bus, unsigned cs) {

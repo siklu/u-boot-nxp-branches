@@ -220,8 +220,7 @@ int board_phy_config(struct phy_device *phydev)
 
 void siklu_primary_si5344d_pll_init(void)
 {
-	siklu_si5344d_get_pll_device_addr();
-	siklu_si5344d_pll_reg_burn();
+	siklu_si5344d_pll_bring_up();
 }
 
 
