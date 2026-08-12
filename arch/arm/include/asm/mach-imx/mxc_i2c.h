@@ -98,12 +98,4 @@ void bus_i2c_init(int index, int speed, int slave_addr,
 		int (*idle_bus_fn)(void *p), void *p);
 int force_idle_bus(void *priv);
 int i2c_idle_bus(struct mxc_i2c_bus *i2c_bus);
-#ifndef CONFIG_DM_I2C
-/*
- * Recovery-only write that ignores the device's acknowledge. See the comment on
- * the definition in drivers/i2c/mxc_i2c.c before reaching for it.
- */
-int i2c_write_blind(unsigned int bus_index, u8 chip, u32 addr, int alen,
-		    const u8 *buf, int len);
-#endif
 #endif
